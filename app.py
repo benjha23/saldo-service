@@ -12,7 +12,7 @@ def ping():
 CASAS = {
     "codere": {
         # Página de login (ajustable si cambia el flujo)
-        "login_url": "https://apuestas.codere.es/es/login",
+        "login_url": "https://codere.es/es/login",
         # Selectores de los campos de login y botón (ajustables si cambian en la web)
         "selector_user": 'input[name="username"]',
         "selector_pass": 'input[name="password"]',
@@ -45,18 +45,62 @@ def leer_saldo_playwright(casa_key: str):
         )
         page = context.new_page()
 
-        # 1) Ir a la página de login
-        page.goto(cfg["login_url"], wait_until="networkidle")
+        # 1) Ir a la home
+page.goto(cfg["login_url"], wait_until="networkidle")
 
-        # 2) Rellenar usuario y contraseña
-        page.fill(cfg["selector_user"], user)
-        page.fill(cfg["selector_pass"], pwd)
+# 1.1) Abrir el modal de "Iniciar sesión" / "Acceder"
+opened = False
+candidatos = [
+    lambda: page.get_by_text("Iniciar sesión", exact=False).first.click(timeout=3000),
+    lambda: page.get_by_text("Acceder", exact=False).first.click(timeout=3000),
+    lambda: page.get_by_role("button", name="Iniciar sesión").click(timeout=3000),
+    lambda: page.get_by_role("button", name="Acceder").click(timeout=3000),
+    lambda: page.locator('a:has-text("Iniciar sesión")').first.click(timeout=3000),
+    lambda: page.locator('a:has-text("Acceder")').first.click(timeout=3000),
+]
+for intento in candidatos:
+    try:
+        intento()
+        opened = True
+        break
+    except:
+        pass
 
-        # 3) Clic en login
-        page.click(cfg["selector_btn"])
+if not opened:
+    raise RuntimeError("No pude abrir el modal de login (no encontré el botón Acceder/Iniciar sesión)")
 
-        # 4) Esperar a que termine la carga tras el login
-        page.wait_for_load_state("networkidle")
+# 1.2) Esperar a que aparezcan los campos del formulario
+# probamos varias opciones típicas
+user_sel = 'input[name="username"], input[type="email"], input[autocomplete="username"]'
+pass_sel = 'input[name="password"], input[type="password"], input[autocomplete="current-password"]'
+
+page.wait_for_selector(user_sel, timeout=12000)
+page.wait_for_selector(pass_sel, timeout=12000)
+
+# 2) Rellenar usuario y contraseña
+page.fill(user_sel, user)
+page.fill(pass_sel, pwd)
+
+# 3) Clic en entrar/enviar dentro del modal
+login_btn_candidates = [
+    'button[type="submit"]',
+    'button:has-text("Entrar")',
+    'button:has-text("Iniciar sesión")',
+    'button:has-text("Acceder")',
+]
+clicked = False
+for sel in login_btn_candidates:
+    try:
+        page.click(sel, timeout=3000)
+        clicked = True
+        break
+    except:
+        pass
+if not clicked:
+    raise RuntimeError("No encontré el botón para enviar el login")
+
+# 4) Espera a que termine la carga tras el login
+page.wait_for_load_state("networkidle")
 
         # 5) Intentar localizar el saldo
         saldo_text = None
