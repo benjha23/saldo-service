@@ -1,5 +1,6 @@
 # Imagen oficial de Playwright con navegadores y deps preinstalados
-FROM mcr.microsoft.com/playwright/python:jammy
+FROM mcr.microsoft.com/playwright/python:v1.54.0-jammy
+
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
