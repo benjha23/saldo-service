@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 import os, time, re
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 app = FastAPI()
 
@@ -8,23 +8,64 @@ app = FastAPI()
 def ping():
     return {"ok": True, "msg": "service up"}
 
-# ===== CONFIGURA AQUÍ LAS CASAS QUE VAS A USAR =====
 CASAS = {
     "codere": {
-        # Página de login (ajustable si cambia el flujo)
-        "login_url": "https://codere.es/es/login",
-        # Selectores de los campos de login y botón (ajustables si cambian en la web)
-        "selector_user": 'input[name="username"]',
-        "selector_pass": 'input[name="password"]',
-        "selector_btn":  'button[type="submit"]',
-        # Selector(es) candidatos para localizar el saldo tras iniciar sesión
+        "login_url": "https://www.codere.es/",
         "selector_saldo": '[data-testid="balance"], .balance, .saldo, [class*="balance"]',
-        # Variables de entorno donde pondrás tus credenciales en Render
         "user_env": "CODERE_USER",
         "pass_env": "CODERE_PASS",
     },
-    # Puedes añadir más casas aquí siguiendo el mismo esquema
 }
+
+def _click_cookies(page):
+    # intenta cerrar consentimientos comunes
+    candidates = [
+        lambda: page.get_by_role("button", name=re.compile("Aceptar", re.I)).click(timeout=1500),
+        lambda: page.get_by_role("button", name=re.compile("Aceptar todas", re.I)).click(timeout=1500),
+        lambda: page.locator("button:has-text('Aceptar')").first.click(timeout=1500),
+        lambda: page.locator("button:has-text('Acepto')").first.click(timeout=1500),
+        lambda: page.locator("[id*='onetrust'] button:has-text('Aceptar')").first.click(timeout=1500),
+    ]
+    for fn in candidates:
+        try:
+            fn()
+            break
+        except:
+            continue
+
+def _open_login_modal(page):
+    # intenta abrir el modal/menu de login con varios triggers
+    open_attempts = [
+        lambda: page.get_by_text("Iniciar sesión", exact=False).first.click(timeout=2000),
+        lambda: page.get_by_text("Acceder", exact=False).first.click(timeout=2000),
+        lambda: page.get_by_role("button", name=re.compile("Iniciar sesión|Acceder|Entrar", re.I)).click(timeout=2000),
+        lambda: page.locator('a:has-text("Iniciar sesión")').first.click(timeout=2000),
+        lambda: page.locator('a:has-text("Acceder")').first.click(timeout=2000),
+        lambda: page.get_by_role("button", name=re.compile("Mi cuenta|Usuario|Perfil", re.I)).click(timeout=2000),
+    ]
+    for fn in open_attempts:
+        try:
+            fn()
+            return True
+        except:
+            continue
+    return False
+
+def _find_in_page_or_frames(page, selector, timeout=12000):
+    # busca un selector en la página principal; si no, recorre iframes
+    try:
+        page.wait_for_selector(selector, timeout=timeout)
+        return page  # selector está en la página principal
+    except PWTimeout:
+        pass
+    # buscar en iframes
+    for fr in page.frames:
+        try:
+            fr.wait_for_selector(selector, timeout=1500)
+            return fr
+        except:
+            continue
+    raise PWTimeout(f"No se encontró selector en página ni iframes: {selector}")
 
 def leer_saldo_playwright(casa_key: str):
     cfg = CASAS.get(casa_key)
@@ -37,72 +78,72 @@ def leer_saldo_playwright(casa_key: str):
         raise RuntimeError(f"Faltan credenciales en variables de entorno para {casa_key}")
 
     with sync_playwright() as p:
-        # En Render: headless=True. Para depurar local, puedes poner False.
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+            locale="es-ES",
         )
         page = context.new_page()
 
-        # 1) Ir a la home
-page.goto(cfg["login_url"], wait_until="networkidle")
+        # 1) Ir a home
+        page.goto(cfg["login_url"], wait_until="networkidle")
+        _click_cookies(page)
 
-# 1.1) Abrir el modal de "Iniciar sesión" / "Acceder"
-opened = False
-candidatos = [
-    lambda: page.get_by_text("Iniciar sesión", exact=False).first.click(timeout=3000),
-    lambda: page.get_by_text("Acceder", exact=False).first.click(timeout=3000),
-    lambda: page.get_by_role("button", name="Iniciar sesión").click(timeout=3000),
-    lambda: page.get_by_role("button", name="Acceder").click(timeout=3000),
-    lambda: page.locator('a:has-text("Iniciar sesión")').first.click(timeout=3000),
-    lambda: page.locator('a:has-text("Acceder")').first.click(timeout=3000),
-]
-for intento in candidatos:
-    try:
-        intento()
-        opened = True
-        break
-    except:
-        pass
+        # 2) Abrir modal/login
+        if not _open_login_modal(page):
+            raise RuntimeError("No pude abrir el modal de login (Acceder/Iniciar sesión)")
 
-if not opened:
-    raise RuntimeError("No pude abrir el modal de login (no encontré el botón Acceder/Iniciar sesión)")
+        # 3) Localizar campos en página o en iframe
+        user_sel = 'input[name="username"], input[type="email"], input[autocomplete="username"], input[id*="user"]'
+        pass_sel = 'input[name="password"], input[type="password"], input[autocomplete="current-password"], input[id*="pass"]'
 
-# 1.2) Esperar a que aparezcan los campos del formulario
-# probamos varias opciones típicas
-user_sel = 'input[name="username"], input[type="email"], input[autocomplete="username"]'
-pass_sel = 'input[name="password"], input[type="password"], input[autocomplete="current-password"]'
+        ctx_user = _find_in_page_or_frames(page, user_sel, timeout=15000)
+        ctx_pass = _find_in_page_or_frames(page, pass_sel, timeout=15000)
 
-page.wait_for_selector(user_sel, timeout=12000)
-page.wait_for_selector(pass_sel, timeout=12000)
+        # Nota: si user/pass están en el mismo frame, ctx_user == ctx_pass
+        ctx_user.fill(user_sel, user)
+        ctx_pass.fill(pass_sel, pwd)
 
-# 2) Rellenar usuario y contraseña
-page.fill(user_sel, user)
-page.fill(pass_sel, pwd)
+        # 4) Click en botón de login (también considerar iframes)
+        btn_candidates = [
+            'button[type="submit"]',
+            'button:has-text("Entrar")',
+            'button:has-text("Iniciar sesión")',
+            'button:has-text("Acceder")',
+        ]
+        clicked = False
+        # primero intenta en el frame de password
+        for sel in btn_candidates:
+            try:
+                ctx_pass.click(sel, timeout=1500)
+                clicked = True
+                break
+            except:
+                continue
+        # si no, intenta en toda la página y en otros frames
+        if not clicked:
+            try:
+                page.click('button[type="submit"]', timeout=1500)
+                clicked = True
+            except:
+                for fr in page.frames:
+                    for sel in btn_candidates:
+                        try:
+                            fr.click(sel, timeout=1000)
+                            clicked = True
+                            break
+                        except:
+                            continue
+                    if clicked:
+                        break
+        if not clicked:
+            raise RuntimeError("No encontré el botón para enviar el login")
 
-# 3) Clic en entrar/enviar dentro del modal
-login_btn_candidates = [
-    'button[type="submit"]',
-    'button:has-text("Entrar")',
-    'button:has-text("Iniciar sesión")',
-    'button:has-text("Acceder")',
-]
-clicked = False
-for sel in login_btn_candidates:
-    try:
-        page.click(sel, timeout=3000)
-        clicked = True
-        break
-    except:
-        pass
-if not clicked:
-    raise RuntimeError("No encontré el botón para enviar el login")
+        # 5) Esperar post-login
+        page.wait_for_load_state("networkidle")
 
-# 4) Espera a que termine la carga tras el login
-page.wait_for_load_state("networkidle")
-
-        # 5) Intentar localizar el saldo
+        # 6) Intentar localizar el saldo
         saldo_text = None
 
         # Intento 1: selector directo
@@ -110,53 +151,7 @@ page.wait_for_load_state("networkidle")
             page.wait_for_selector(cfg["selector_saldo"], timeout=12000)
             saldo_text = page.inner_text(cfg["selector_saldo"]).strip()
         except:
-            pass
-
-        # Intento 2: buscar por texto "Saldo" (y extraer el número cercano)
-        if not saldo_text:
-            try:
-                saldo_locator = page.get_by_text("Saldo", exact=False).first
-                container_text = ""
+            # probar en frames
+            for fr in page.frames:
                 try:
-                    container_text = saldo_locator.locator("xpath=..").inner_text().strip()
-                except:
-                    pass
-                if not container_text:
-                    try:
-                        container_text = saldo_locator.inner_text().strip()
-                    except:
-                        pass
-
-                # Patrón típico de importes con €: 1.234,56 € o 123,45 €
-                m = re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}\s*€|\d+,\d{2}\s*€", container_text)
-                if m:
-                    saldo_text = m.group(0)
-            except:
-                pass
-
-        if not saldo_text:
-            # Aquí podríamos añadir más estrategias (navegar a perfil/cartera, etc.)
-            raise RuntimeError("No pude encontrar el saldo tras el login")
-
-        browser.close()
-
-    # Normalizar a número
-    try:
-        saldo_num = float(saldo_text.replace("€", "").replace(".", "").replace(",", "."))
-    except:
-        saldo_num = None
-
-    return {
-        "casa": casa_key,
-        "saldo_raw": saldo_text,
-        "saldo_num": saldo_num,
-        "fecha": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-@app.get("/saldo/{casa}")
-def saldo(casa: str):
-    try:
-        data = leer_saldo_playwright(casa)
-        return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                    fr.wait_for_selector(cfg["selector_saldo"], ti_]()
