@@ -56,3 +56,4 @@ def saldo(casa: str):
         return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+"Añade endpoint /saldo/{casa} con placeholders"
