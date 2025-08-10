@@ -11,7 +11,7 @@ def ping():
 CASAS = {
     "codere": {
         # URL móvil que me pasaste
-        "login_url": "https://m.apuestas.codere.es/deportesEs/#/HomePage",
+        "login_url": "https://m.apuestas.codere.es/deportesEs/#/HomePage?openlogin=true",
         "selector_saldo": '[data-testid="balance"], .balance, .saldo, [class*="balance"], [class*="wallet"], [class*="account"]',
         "user_env": "CODERE_USER",
         "pass_env": "CODERE_PASS",
