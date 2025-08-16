@@ -151,7 +151,7 @@ def saldo(casa: str):
         data = leer_saldo_playwright(casa)
         return data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)})
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/debug/{casa}")
 def debug_casa(casa: str):
