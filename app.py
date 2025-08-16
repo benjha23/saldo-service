@@ -1,41 +1,35 @@
 from fastapi import FastAPI, HTTPException
 import os, time, re, base64
 from pathlib import Path
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 app = FastAPI()
 
 @app.get("/ping")
 def ping():
-    return {"ok": True, "msg": "service up"}
+    return {"ok": True, "msg": "service up – v-storage"}
 
-# === Configuración de casas soportadas ===
+
 CASAS = {
     "codere": {
-        # Ya logueado con storage_state
         "home_url": "https://m.apuestas.codere.es/deportesEs/#/HomePage",
         "alt_urls": [
             "https://m.apuestas.codere.es/deportesEs/#/MyAccount",
             "https://m.apuestas.codere.es/deportesEs/#/Wallet",
             "https://m.apuestas.codere.es/deportesEs/#/Account",
         ],
-        # Selectores y búsqueda por texto para saldo
         "selector_saldo": (
             "[data-testid='balance'], .balance, .saldo, "
             "[class*='balance'], [class*='wallet'], [class*='account']"
         ),
-        # Variable de entorno con la sesión en base64
         "state_env": "CODERE_STATE_B64",
     },
 }
 
 def _write_state_from_env(env_key: str) -> str:
-    """Decodifica el storage_state (base64) desde env y lo guarda en /tmp/*.json."""
     b64 = os.getenv(env_key)
     if not b64:
-        raise RuntimeError(
-            f"No hay variable de entorno {env_key} con el storage_state en base64."
-        )
+        raise RuntimeError(f"No hay variable de entorno {env_key} con el storage_state en base64.")
     try:
         raw = base64.b64decode(b64)
     except Exception as e:
@@ -44,21 +38,39 @@ def _write_state_from_env(env_key: str) -> str:
     tmp_path.write_bytes(raw)
     return str(tmp_path)
 
+def _launch_browser(p):
+    engine = (os.getenv("PW_ENGINE") or "chromium").lower().strip()
+    if engine == "webkit":
+        return p.webkit.launch(headless=True)
+    if engine == "firefox":
+        return p.firefox.launch(headless=True)
+    return p.chromium.launch(headless=True)  # default
+
+def _new_mobile_context(browser, storage_state):
+    return browser.new_context(
+        storage_state=storage_state,
+        user_agent=("Mozilla/5.0 (Linux; Android 12; Pixel 5) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Mobile Safari/537.36"),
+        viewport={"width": 414, "height": 896},
+        is_mobile=True,
+        device_scale_factor=2,
+        has_touch=True,
+        locale="es-ES",
+    )
+
 def _try_read_balance(ctx, selector_saldo: str):
-    """Intenta leer saldo por selector directo o por texto cercano ('Saldo', 'Balance', etc.)."""
-    # 1) Selector directo
+    # 1) Por selector directo
     try:
-        ctx.wait_for_selector(selector_saldo, timeout=8000)
+        ctx.wait_for_selector(selector_saldo, timeout=6000)
         return ctx.inner_text(selector_saldo).strip()
     except:
         pass
-
-    # 2) Por texto visible
+    # 2) Por texto cercano
     palabras = ["Saldo", "Balance", "Mi saldo", "Disponible"]
     for palabra in palabras:
         try:
             loc = ctx.get_by_text(palabra, exact=False).first
-            # Subir a contenedor y extraer cantidad con €
             try:
                 txt = loc.locator("xpath=..").inner_text().strip()
             except:
@@ -75,70 +87,54 @@ def leer_saldo_playwright(casa_key: str):
     if not cfg:
         raise RuntimeError(f"Casa no soportada: {casa_key}")
 
-    # Cargar storage_state desde env
     state_file = _write_state_from_env(cfg["state_env"])
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        # Emulación móvil (igual que cuando guardaste la sesión)
-        context = browser.new_context(
-            storage_state=state_file,
-            user_agent=("Mozilla/5.0 (Linux; Android 12; Pixel 5) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Mobile Safari/537.36"),
-            viewport={"width": 414, "height": 896},
-            is_mobile=True,
-            device_scale_factor=2,
-            has_touch=True,
-            locale="es-ES",
-        )
+        browser = _launch_browser(p)
+        context = _new_mobile_context(browser, state_file)
         page = context.new_page()
 
-        # 1) Ir a Home (debería reconocerte logueado)
-        page.goto(cfg["home_url"], wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
+        # límites de espera para que no "se quede pensando"
+        page.set_default_timeout(8000)
+        page.set_default_navigation_timeout(15000)
 
-        # 2) Intentar leer saldo en Home
+        # 1) Home
+        page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=10000)
+
+        # 2) Intentar leer en home
         saldo_text = _try_read_balance(page, cfg["selector_saldo"])
 
-        # 3) Probar en iframes si no se encontró
+        # 3) Probar frames
         if not saldo_text:
             for fr in page.frames:
                 saldo_text = _try_read_balance(fr, cfg["selector_saldo"])
                 if saldo_text:
                     break
 
-        # 4) Probar rutas alternativas (Mi cuenta / Wallet / Account)
+        # 4) Probar rutas alternativas
         if not saldo_text:
             for url in cfg["alt_urls"]:
                 try:
-                    page.goto(url, wait_until="domcontentloaded")
-                    page.wait_for_load_state("networkidle")
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_load_state("networkidle", timeout=10000)
                     saldo_text = _try_read_balance(page, cfg["selector_saldo"])
                     if not saldo_text:
                         for fr in page.frames:
                             saldo_text = _try_read_balance(fr, cfg["selector_saldo"])
-                            if saldo_text:
-                                break
+                            if saldo_text: break
                     if saldo_text:
                         break
                 except:
                     continue
 
-        if not saldo_text:
-            frame_info = [(fr.url, fr.name) for fr in page.frames]
-            browser.close()
-            raise RuntimeError(
-                f"No pude encontrar el saldo con la sesión guardada. Frames vistos: {frame_info}"
-            )
-
         browser.close()
 
-    # Normalizar a número (opcional)
+    if not saldo_text:
+        raise RuntimeError("No pude encontrar el saldo con la sesión guardada (tras timeouts).")
+
     try:
-        saldo_num = float(
-            saldo_text.replace("€", "").replace(".", "").replace(",", ".")
-        )
+        saldo_num = float(saldo_text.replace("€", "").replace(".", "").replace(",", "."))
     except:
         saldo_num = None
 
@@ -155,4 +151,50 @@ def saldo(casa: str):
         data = leer_saldo_playwright(casa)
         return data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)})
+
+@app.get("/debug/{casa}")
+def debug_casa(casa: str):
+    """Carga sesión y devuelve info para diagnosticar: URL, frames y trozos de texto útiles."""
+    cfg = CASAS.get(casa)
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Casa no soportada")
+
+    state_file = _write_state_from_env(cfg["state_env"])
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = _new_mobile_context(browser, state_file)
+        page = context.new_page()
+        page.set_default_timeout(7000)
+        page.set_default_navigation_timeout(12000)
+
+        page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=12000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except:
+            pass
+
+        info = {
+            "url": page.url,
+            "frames": [],
+            "sampleTexts": [],
+        }
+
+        # listar frames
+        for fr in page.frames:
+            info["frames"].append({"name": fr.name, "url": fr.url})
+
+        # tomar pequeños trozos de texto que nos orienten
+        palabras = ["saldo", "balance", "mi saldo", "disponible", "cuenta", "wallet"]
+        for palabra in palabras:
+            try:
+                loc = page.get_by_text(re.compile(palabra, re.I), exact=False).first
+                snippet = loc.inner_text()[:120]
+                info["sampleTexts"].append({palabra: snippet})
+            except:
+                continue
+
+        browser.close()
+
+    return info
