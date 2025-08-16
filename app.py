@@ -155,7 +155,7 @@ def saldo(casa: str):
 
 @app.get("/debug/{casa}")
 def debug_casa(casa: str):
-    """Carga sesión y devuelve info para diagnosticar: URL, frames y trozos de texto útiles."""
+    """Diagnóstico: comprueba sesión, recorre rutas internas y busca indicios de saldo."""
     cfg = CASAS.get(casa)
     if not cfg:
         raise HTTPException(status_code=400, detail="Casa no soportada")
@@ -169,32 +169,67 @@ def debug_casa(casa: str):
         page.set_default_timeout(7000)
         page.set_default_navigation_timeout(12000)
 
+        tried = []
+
+        def scan(ctx, label):
+            # intenta recoger título, url, fragmentos de texto y números con €
+            out = {"label": label, "url": ctx.url if hasattr(ctx, "url") else "", "foundText": [], "foundNumber": None}
+            try:
+                # por palabras clave
+                for palabra in ["Saldo", "Balance", "Mi saldo", "Disponible", "Cuenta", "Wallet"]:
+                    try:
+                        loc = ctx.get_by_text(re.compile(palabra, re.I), exact=False).first
+                        snippet = loc.inner_text()[:160]
+                        out["foundText"].append({palabra: snippet})
+                    except:
+                        continue
+                # por HTML (aunque no sea visible)
+                try:
+                    html = ctx.content()
+                    m = re.search(r"\d{1,3}(?:\.\d{3})*,\d{2}\s*€|\d+,\d{2}\s*€", html)
+                    if m:
+                        out["foundNumber"] = m.group(0)
+                except:
+                    pass
+            except:
+                pass
+            return out
+
+        # 1) Home
         page.goto(cfg["home_url"], wait_until="domcontentloaded", timeout=12000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=8000)
-        except:
-            pass
+        try: page.wait_for_load_state("networkidle", timeout=8000)
+        except: pass
+        tried.append(scan(page, "Home"))
+        for fr in page.frames:
+            tried.append(scan(fr, f"HomeFrame:{fr.name or 'unnamed'}"))
+
+        # 2) Rutas internas
+        for url in cfg.get("alt_urls", []):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=12000)
+                try: page.wait_for_load_state("networkidle", timeout=8000)
+                except: pass
+                tried.append(scan(page, url))
+                for fr in page.frames:
+                    tried.append(scan(fr, f"{url}::Frame:{fr.name or 'unnamed'}"))
+            except:
+                tried.append({"label": url, "error": "navigation failed"})
+
+        # 3) Señales de login / cookies
+        cookies = context.cookies()
+        cookie_domains = sorted(list({c.get("domain","") for c in cookies}))
+        title = ""
+        try: title = page.title()
+        except: pass
 
         info = {
-            "url": page.url,
-            "frames": [],
-            "sampleTexts": [],
+            "engine": (os.getenv("PW_ENGINE") or "chromium"),
+            "currentUrl": page.url,
+            "title": title,
+            "cookieDomains": cookie_domains,
+            "cookiesCount": len(cookies),
+            "tried": tried,
         }
-
-        # listar frames
-        for fr in page.frames:
-            info["frames"].append({"name": fr.name, "url": fr.url})
-
-        # tomar pequeños trozos de texto que nos orienten
-        palabras = ["saldo", "balance", "mi saldo", "disponible", "cuenta", "wallet"]
-        for palabra in palabras:
-            try:
-                loc = page.get_by_text(re.compile(palabra, re.I), exact=False).first
-                snippet = loc.inner_text()[:120]
-                info["sampleTexts"].append({palabra: snippet})
-            except:
-                continue
-
         browser.close()
 
     return info
